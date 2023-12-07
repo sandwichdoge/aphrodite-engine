@@ -10,7 +10,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import uvicorn
-from fastapi import Request, Response
+from fastapi import Request, Response, Header, HTTPException, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -30,6 +30,7 @@ from aphrodite.common.outputs import RequestOutput
 from aphrodite.common.sampling_params import SamplingParams
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
 from aphrodite.common.utils import random_uuid
+from aphrodite.common.logits_processor import BiasLogitsProcessor
 
 try:
     import fastchat
@@ -45,6 +46,20 @@ logger = init_logger(__name__)
 served_model = None
 app = fastapi.FastAPI()
 engine = None
+
+
+def _verify_api_key(x_api_key: str = Header(None),
+                    authorization: str = Header(None)):
+    if x_api_key and x_api_key in EXPECTED_API_KEYS:
+        return x_api_key
+    elif authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token in EXPECTED_API_KEYS:
+            return token
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid API Key",
+    )
 
 
 def create_error_response(status_code: HTTPStatus,
@@ -152,7 +167,9 @@ async def health() -> Response:
 
 
 @app.get("/v1/models")
-async def show_available_models():
+async def show_available_models(
+        # pylint: disable=unused-argument
+        api_key: str = Depends(_verify_api_key)):
     """Show available models. Right now we only have one model."""
     model_cards = [
         ModelCard(id=served_model,
@@ -187,8 +204,11 @@ def create_logprobs(token_ids: List[int],
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest,
-                                 raw_request: Request):
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    raw_request: Request,
+    # pylint: disable=unused-argument
+    api_key: str = Depends(_verify_api_key)):
     """Completion API similar to OpenAI's API.
 
     See  https://platform.openai.com/docs/api-reference/chat/create
@@ -208,9 +228,22 @@ async def create_chat_completion(request: ChatCompletionRequest,
     if error_check_ret is not None:
         return error_check_ret
 
+    if not request.logit_bias:
+        logit_processors = []
+    else:
+        biases = dict(
+            map(lambda bias: (int(bias[0]), bias[1]),
+                request.logit_bias.items()))
+        logit_processors = [BiasLogitsProcessor(biases)]
+
     model_name = request.model
     request_id = f"cmpl-{random_uuid()}"
     created_time = int(time.time())
+
+    # We disable top_k at -1, add this conversion for
+    # compatibility
+    if request.top_k == 0:
+        request.top_k = -1
     try:
         sampling_params = SamplingParams(
             n=request.n,
@@ -221,10 +254,14 @@ async def create_chat_completion(request: ChatCompletionRequest,
             top_p=request.top_p,
             top_k=request.top_k,
             top_a=request.top_a,
+            min_p=request.min_p,
             tfs=request.tfs,
             eta_cutoff=request.eta_cutoff,
             epsilon_cutoff=request.epsilon_cutoff,
             typical_p=request.typical_p,
+            mirostat_mode=request.mirostat_mode,
+            mirostat_tau=request.mirostat_tau,
+            mirostat_eta=request.mirostat_eta,
             stop=request.stop,
             stop_token_ids=request.stop_token_ids,
             max_tokens=request.max_tokens,
@@ -237,6 +274,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
             custom_token_bans=request.custom_token_bans,
             logprobs=request.logprobs,
             prompt_logprobs=request.prompt_logprobs,
+            logits_processors=logit_processors,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -357,7 +395,11 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
 
 @app.post("/v1/completions")
-async def create_completion(request: CompletionRequest, raw_request: Request):
+async def create_completion(
+    request: CompletionRequest,
+    raw_request: Request,
+    # pylint: disable=unused-argument
+    api_key: str = Depends(_verify_api_key)):
     """Completion API similar to OpenAI's API.
 
     See https://platform.openai.com/docs/api-reference/completions/create
@@ -374,6 +416,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
         return error_check_ret
+
+    if not request.logit_bias:
+        logit_processors = []
+    else:
+        biases = dict(
+            map(lambda bias: (int(bias[0]), bias[1]),
+                request.logit_bias.items()))
+        logit_processors = [BiasLogitsProcessor(biases)]
 
     if request.echo:
         # We do not support echo since the Aphrodite engine does not
@@ -417,6 +467,12 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return error_check_ret
 
     created_time = int(time.time())
+
+    # We disable top_k at -1, add this conversion for
+    # compatibility
+    if request.top_k == 0:
+        request.top_k = -1
+
     try:
         sampling_params = SamplingParams(
             n=request.n,
@@ -427,10 +483,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             top_k=request.top_k,
             top_a=request.top_a,
+            min_p=request.min_p,
             tfs=request.tfs,
             eta_cutoff=request.eta_cutoff,
             epsilon_cutoff=request.epsilon_cutoff,
             typical_p=request.typical_p,
+            mirostat_mode=request.mirostat_mode,
+            mirostat_tau=request.mirostat_tau,
+            mirostat_eta=request.mirostat_eta,
             stop=request.stop,
             stop_token_ids=request.stop_token_ids,
             max_tokens=request.max_tokens,
@@ -443,6 +503,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             custom_token_bans=request.custom_token_bans,
             logprobs=request.logprobs,
             prompt_logprobs=request.prompt_logprobs,
+            logits_processors=logit_processors,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -608,10 +669,16 @@ if __name__ == "__main__":
                         help="The model name used in the API. If not "
                         "specified, the model name will be the same as "
                         "the huggingface name.")
+    parser.add_argument("--api-keys",
+                        nargs="*",
+                        required=True,
+                        help="Authorization API Keys for the server.")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
 
+    global EXPECTED_API_KEYS  # pylint: disable=global-at-module-level
+    EXPECTED_API_KEYS = args.api_keys
     app.add_middleware(
         CORSMiddleware,
         allow_origins=args.allowed_origins,
